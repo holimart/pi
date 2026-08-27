@@ -46,4 +46,23 @@ describe("model selector", () => {
 			expect(rendered).toContain("Could not refresh 2 model catalogs (openai, anthropic); showing cached models.");
 		});
 	});
+
+	it("uses the supplied snapshot without refreshing when the host denies catalog access", async () => {
+		harness = await createHarness();
+		const refresh = vi.spyOn(harness.session.modelRuntime, "refresh");
+
+		new ModelSelectorComponent(
+			createFakeTui(),
+			harness.getModel(),
+			harness.settingsManager,
+			harness.session.modelRuntime,
+			[],
+			() => {},
+			() => {},
+			undefined,
+			false,
+		);
+
+		expect(refresh).not.toHaveBeenCalled();
+	});
 });

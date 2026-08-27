@@ -47,6 +47,7 @@ function createUiContext(
 type LoadedResourcesResult<T> = { [K in keyof T]: T[K] } & { diagnostics: [] };
 
 type LoadedResourcesContext = {
+	isCapabilityAllowed: () => boolean;
 	loadedResourcesContainer: Container;
 	chatContainer: Container;
 	options: { verbose?: boolean };
@@ -87,6 +88,7 @@ type RebindContext = {
 };
 
 type ReloadCommandContext = {
+	denyCapability: () => boolean;
 	hideThinkingBlock: boolean;
 	session: {
 		isStreaming: boolean;
@@ -156,6 +158,7 @@ type ReloadCommandContextOverrides = Omit<
 function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {}): ReloadCommandContext {
 	const editor = overrides.editor ?? {};
 	return {
+		denyCapability: () => false,
 		hideThinkingBlock: overrides.hideThinkingBlock ?? false,
 		session: {
 			isStreaming: false,
@@ -223,6 +226,7 @@ function getMessageText(event: MessageEvent): string {
 
 function createLoadedResourcesContext(): LoadedResourcesContext {
 	return {
+		isCapabilityAllowed: () => true,
 		loadedResourcesContainer: new Container(),
 		chatContainer: new Container(),
 		options: { verbose: true },

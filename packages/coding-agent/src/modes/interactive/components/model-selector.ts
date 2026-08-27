@@ -76,6 +76,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		onSelect: (model: Model<any>) => void,
 		onCancel: () => void,
 		initialSearchInput?: string,
+		refreshModels = true,
 	) {
 		super();
 
@@ -133,7 +134,11 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (initialSearchInput) this.filterModels(initialSearchInput);
 		else this.updateList();
 		this.tui.requestRender();
-		void this.refreshModels();
+		if (refreshModels) {
+			void this.refreshModels();
+		} else {
+			this.refreshStatusMessage = "";
+		}
 	}
 
 	private loadModelsFromSnapshot(): void {

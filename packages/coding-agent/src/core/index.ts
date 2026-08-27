@@ -9,6 +9,7 @@ export {
 	type AgentSessionEventListener,
 	type ModelCycleResult,
 	type PromptOptions,
+	type SessionResourceCapabilities,
 	type SessionStats,
 } from "./agent-session.ts";
 export {

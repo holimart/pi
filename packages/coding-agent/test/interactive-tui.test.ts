@@ -135,6 +135,7 @@ describe("InteractiveMode right-click paste", () => {
 		const target = { render: () => [], invalidate: () => {}, handleInput } satisfies Component;
 		const requestRender = vi.fn();
 		const context = {
+			denyCapability: () => false,
 			renderer: { getFocusedComponent: () => target },
 			ui: { requestRender },
 		};
@@ -150,6 +151,7 @@ describe("InteractiveMode right-click paste", () => {
 });
 
 type CopyCommandContext = {
+	denyCapability: () => boolean;
 	session: { getLastAssistantText: () => string | undefined };
 	ui: ReturnType<typeof createInteractiveTui>;
 	showStatus: (message: string) => void;
@@ -181,6 +183,7 @@ describe("InteractiveMode copy confirmation", () => {
 		const showStatus = vi.fn();
 		const showError = vi.fn();
 		const context: CopyCommandContext = {
+			denyCapability: () => false,
 			session: { getLastAssistantText: () => "assistant response" },
 			ui,
 			showStatus,
@@ -212,6 +215,7 @@ describe("InteractiveMode copy confirmation", () => {
 		const showStatus = vi.fn();
 		const showError = vi.fn();
 		const context: CopyCommandContext = {
+			denyCapability: () => false,
 			session: { getLastAssistantText: () => "assistant response" },
 			ui,
 			showStatus,

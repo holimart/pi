@@ -225,6 +225,19 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Opt-in resource allowlist. Omitted preserves the native unrestricted behavior. */
+	resourceCapabilities?: SessionResourceCapabilities;
+}
+
+/** Resource authorities that can be disabled for a supervisor-managed session. */
+export interface SessionResourceCapabilities {
+	extensions?: boolean;
+	templates?: boolean;
+	skills?: boolean;
+	themes?: boolean;
+	systemPrompt?: boolean;
+	appendSystemPrompt?: boolean;
+	contextFiles?: boolean;
 }
 
 export interface ExtensionBindings {
@@ -360,6 +373,7 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private readonly _resourceCapabilities?: Readonly<SessionResourceCapabilities>;
 
 	private _modelRuntime: ModelRuntime;
 
@@ -389,6 +403,15 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._resourceCapabilities = config.resourceCapabilities
+			? Object.freeze({ ...config.resourceCapabilities })
+			: undefined;
+		if (
+			this._resourceCapabilities !== undefined &&
+			!this._matchesResourceCapabilities(this._resourceLoader.resourceCapabilities)
+		) {
+			throw new Error("Managed session resource capabilities must be applied when constructing the resource loader");
+		}
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -398,8 +421,37 @@ export class AgentSession {
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
-			includeAllExtensionTools: true,
+			includeAllExtensionTools: this._areExtensionsAllowed(),
 		});
+	}
+
+	private _isResourceAllowed(resource: keyof SessionResourceCapabilities): boolean {
+		return this._resourceCapabilities === undefined || this._resourceCapabilities[resource] === true;
+	}
+
+	private _matchesResourceCapabilities(
+		resourceCapabilities: Readonly<SessionResourceCapabilities> | undefined,
+	): boolean {
+		if (this._resourceCapabilities === undefined) return true;
+		if (resourceCapabilities === undefined) return false;
+		const resources: Array<keyof SessionResourceCapabilities> = [
+			"extensions",
+			"templates",
+			"skills",
+			"themes",
+			"systemPrompt",
+			"appendSystemPrompt",
+			"contextFiles",
+		];
+		return resources.every((resource) => resourceCapabilities[resource] === this._resourceCapabilities?.[resource]);
+	}
+
+	private _areExtensionsAllowed(): boolean {
+		return this._isResourceAllowed("extensions");
+	}
+
+	get resourceCapabilities(): Readonly<SessionResourceCapabilities> | undefined {
+		return this._resourceCapabilities;
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -993,7 +1045,7 @@ export class AgentSession {
 
 	/** File-based prompt templates */
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
-		return this._resourceLoader.getPrompts().prompts;
+		return this._isResourceAllowed("templates") ? this._resourceLoader.getPrompts().prompts : [];
 	}
 
 	private _normalizePromptSnippet(text: string | undefined): string | undefined {
@@ -1036,12 +1088,18 @@ export class AgentSession {
 			}
 		}
 
-		const loaderSystemPrompt = this._resourceLoader.getSystemPrompt();
-		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
+		const loaderSystemPrompt = this._isResourceAllowed("systemPrompt")
+			? this._resourceLoader.getSystemPrompt()
+			: undefined;
+		const loaderAppendSystemPrompt = this._isResourceAllowed("appendSystemPrompt")
+			? this._resourceLoader.getAppendSystemPrompt()
+			: [];
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
-		const loadedSkills = this._resourceLoader.getSkills().skills;
-		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
+		const loadedSkills = this._isResourceAllowed("skills") ? this._resourceLoader.getSkills().skills : [];
+		const loadedContextFiles = this._isResourceAllowed("contextFiles")
+			? this._resourceLoader.getAgentsFiles().agentsFiles
+			: [];
 
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
@@ -1121,7 +1179,7 @@ export class AgentSession {
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
-			if (expandPromptTemplates && text.startsWith("/")) {
+			if (this._areExtensionsAllowed() && expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
@@ -1139,7 +1197,7 @@ export class AgentSession {
 			// Emit input event for extension interception (before skill/template expansion)
 			let currentText = text;
 			let currentImages = options?.images;
-			if (this._extensionRunner.hasHandlers("input")) {
+			if (this._areExtensionsAllowed() && this._extensionRunner.hasHandlers("input")) {
 				const inputResult = await this._extensionRunner.emitInput(
 					currentText,
 					currentImages,
@@ -1159,7 +1217,9 @@ export class AgentSession {
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
 			if (expandPromptTemplates) {
-				expandedText = this._expandSkillCommand(expandedText);
+				if (this._isResourceAllowed("skills")) {
+					expandedText = this._expandSkillCommand(expandedText);
+				}
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
@@ -1230,12 +1290,14 @@ export class AgentSession {
 			this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				expandedText,
-				currentImages,
-				this._baseSystemPrompt,
-				this._baseSystemPromptOptions,
-			);
+			const result = this._areExtensionsAllowed()
+				? await this._extensionRunner.emitBeforeAgentStart(
+						expandedText,
+						currentImages,
+						this._baseSystemPrompt,
+						this._baseSystemPromptOptions,
+					)
+				: undefined;
 			// Add all custom messages from extensions
 			if (result?.messages) {
 				for (const msg of result.messages) {
@@ -1347,7 +1409,7 @@ export class AgentSession {
 		}
 
 		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
+		let expandedText = this._isResourceAllowed("skills") ? this._expandSkillCommand(text) : text;
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		await this._queueSteer(expandedText, images);
@@ -1367,7 +1429,7 @@ export class AgentSession {
 		}
 
 		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
+		let expandedText = this._isResourceAllowed("skills") ? this._expandSkillCommand(text) : text;
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		await this._queueFollowUp(expandedText, images);
@@ -2235,6 +2297,9 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		if (!this._areExtensionsAllowed()) {
+			return;
+		}
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -2585,7 +2650,7 @@ export class AgentSession {
 		}
 
 		this._extensionRunner = new ExtensionRunner(
-			extensionsResult.extensions,
+			this._areExtensionsAllowed() ? extensionsResult.extensions : [],
 			extensionsResult.runtime,
 			this._cwd,
 			this.sessionManager,
@@ -2594,8 +2659,10 @@ export class AgentSession {
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
 		}
-		this._bindExtensionCore(this._extensionRunner);
-		this._applyExtensionBindings(this._extensionRunner);
+		if (this._areExtensionsAllowed()) {
+			this._bindExtensionCore(this._extensionRunner);
+			this._applyExtensionBindings(this._extensionRunner);
+		}
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
@@ -2603,7 +2670,7 @@ export class AgentSession {
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
-			includeAllExtensionTools: options.includeAllExtensionTools,
+			includeAllExtensionTools: this._areExtensionsAllowed() && options.includeAllExtensionTools,
 		});
 	}
 
@@ -2619,7 +2686,7 @@ export class AgentSession {
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),
 			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
+			includeAllExtensionTools: this._areExtensionsAllowed(),
 		});
 
 		const hasBindings =
@@ -2627,7 +2694,7 @@ export class AgentSession {
 			this._extensionCommandContextActions ||
 			this._extensionShutdownHandler ||
 			this._extensionErrorListener;
-		if (hasBindings) {
+		if (this._areExtensionsAllowed() && hasBindings) {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
 			await this.extendResourcesFromExtensions("reload");

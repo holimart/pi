@@ -18,6 +18,7 @@ describe("InteractiveMode.maybeWarnAboutAnthropicSubscriptionAuth", () => {
 	test("warns once when Anthropic subscription auth is detected", async () => {
 		const modelRuntime = createModelRuntime(undefined, "sk-ant-oat01-test");
 		const fakeThis: any = {
+			isCapabilityAllowed: () => true,
 			anthropicSubscriptionWarningShown: false,
 			settingsManager: createSettingsManager(),
 			session: { modelRuntime },
@@ -38,6 +39,7 @@ describe("InteractiveMode.maybeWarnAboutAnthropicSubscriptionAuth", () => {
 	test("warns when Anthropic OAuth is stored even if token refresh lookup would fail", async () => {
 		const modelRuntime = createModelRuntime({ type: "oauth" });
 		const fakeThis: any = {
+			isCapabilityAllowed: () => true,
 			anthropicSubscriptionWarningShown: false,
 			settingsManager: createSettingsManager(),
 			session: { modelRuntime },
@@ -55,6 +57,7 @@ describe("InteractiveMode.maybeWarnAboutAnthropicSubscriptionAuth", () => {
 	test("does not warn for non-Anthropic models", async () => {
 		const modelRuntime = createModelRuntime(undefined);
 		const fakeThis: any = {
+			isCapabilityAllowed: () => true,
 			anthropicSubscriptionWarningShown: false,
 			settingsManager: createSettingsManager(),
 			session: { modelRuntime },
@@ -72,6 +75,7 @@ describe("InteractiveMode.maybeWarnAboutAnthropicSubscriptionAuth", () => {
 	test("does not warn when Anthropic extra usage warning is disabled", async () => {
 		const modelRuntime = createModelRuntime(undefined);
 		const fakeThis: any = {
+			isCapabilityAllowed: () => true,
 			anthropicSubscriptionWarningShown: false,
 			settingsManager: createSettingsManager({ anthropicExtraUsage: false }),
 			session: { modelRuntime },

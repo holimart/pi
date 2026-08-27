@@ -26,6 +26,7 @@ function openSelector(harness: Harness, initialModels: readonly Model<Api>[]) {
 			}),
 	);
 	const context = {
+		isCapabilityAllowed: () => true,
 		session: harness.session,
 		settingsManager: harness.settingsManager,
 		showSelector: (

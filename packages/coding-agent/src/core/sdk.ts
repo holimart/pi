@@ -3,7 +3,7 @@ import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
-import { AgentSession } from "./agent-session.ts";
+import { AgentSession, type SessionResourceCapabilities } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
@@ -82,6 +82,8 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Opt-in resource allowlist for a supervisor-managed session. */
+	resourceCapabilities?: SessionResourceCapabilities;
 }
 
 /** Result from createAgentSession */
@@ -179,7 +181,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
-		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+		resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			noExtensions: options.resourceCapabilities !== undefined && options.resourceCapabilities.extensions !== true,
+			noSkills: options.resourceCapabilities !== undefined && options.resourceCapabilities.skills !== true,
+			noPromptTemplates:
+				options.resourceCapabilities !== undefined && options.resourceCapabilities.templates !== true,
+			noThemes: options.resourceCapabilities !== undefined && options.resourceCapabilities.themes !== true,
+			noContextFiles:
+				options.resourceCapabilities !== undefined && options.resourceCapabilities.contextFiles !== true,
+			noSystemPrompt:
+				options.resourceCapabilities !== undefined && options.resourceCapabilities.systemPrompt !== true,
+			noAppendSystemPrompt:
+				options.resourceCapabilities !== undefined && options.resourceCapabilities.appendSystemPrompt !== true,
+			resourceCapabilities: options.resourceCapabilities,
+		});
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
 	}
@@ -387,6 +405,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		resourceCapabilities: options.resourceCapabilities,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

@@ -21,6 +21,7 @@ export {
 	type ParsedSkillBlock,
 	type PromptOptions,
 	parseSkillBlock,
+	type SessionResourceCapabilities,
 	type SessionStats,
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
@@ -335,6 +336,7 @@ export {
 	InteractiveMode,
 	type InteractiveModeOptions,
 	type JsonAgentSessionEvent,
+	type ManagedInteractiveCapabilities,
 	type ModelInfo,
 	type PrintModeOptions,
 	RpcClient,

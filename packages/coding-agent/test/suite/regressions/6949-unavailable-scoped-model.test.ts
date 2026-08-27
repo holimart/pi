@@ -17,6 +17,7 @@ function createInteractiveContext(options: {
 	const setScopedModels = vi.fn();
 	const getAvailableSnapshot = vi.fn(() => options.allModels);
 	const context = {
+		isCapabilityAllowed: () => true,
 		session: {
 			modelRuntime: {
 				refresh: vi.fn().mockResolvedValue({ aborted: false, errors: new Map() }),

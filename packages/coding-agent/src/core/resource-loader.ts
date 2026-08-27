@@ -8,6 +8,7 @@ import type { ResourceDiagnostic } from "./diagnostics.ts";
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
+import type { SessionResourceCapabilities } from "./agent-session.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
 import {
 	clearExtensionCache,
@@ -37,6 +38,7 @@ export interface ResourceLoaderReloadOptions {
 }
 
 export interface ResourceLoader {
+	readonly resourceCapabilities?: Readonly<SessionResourceCapabilities>;
 	getExtensions(): LoadExtensionsResult;
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] };
 	getPrompts(): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] };
@@ -170,6 +172,10 @@ export interface DefaultResourceLoaderOptions {
 	noPromptTemplates?: boolean;
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	noSystemPrompt?: boolean;
+	noAppendSystemPrompt?: boolean;
+	/** Opt-in resource allowlist for a supervisor-managed session. */
+	resourceCapabilities?: SessionResourceCapabilities;
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
@@ -193,6 +199,7 @@ export interface DefaultResourceLoaderOptions {
 }
 
 export class DefaultResourceLoader implements ResourceLoader {
+	readonly resourceCapabilities?: Readonly<SessionResourceCapabilities>;
 	private cwd: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
@@ -208,6 +215,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private noPromptTemplates: boolean;
 	private noThemes: boolean;
 	private noContextFiles: boolean;
+	private noSystemPrompt: boolean;
+	private noAppendSystemPrompt: boolean;
 	private systemPromptSource?: string;
 	private appendSystemPromptSource?: string[];
 	private extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
@@ -270,6 +279,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.noPromptTemplates = options.noPromptTemplates ?? false;
 		this.noThemes = options.noThemes ?? false;
 		this.noContextFiles = options.noContextFiles ?? false;
+		this.noSystemPrompt = options.noSystemPrompt ?? false;
+		this.noAppendSystemPrompt = options.noAppendSystemPrompt ?? false;
+		this.resourceCapabilities = options.resourceCapabilities
+			? Object.freeze({ ...options.resourceCapabilities })
+			: undefined;
 		this.systemPromptSource = options.systemPrompt;
 		this.appendSystemPromptSource = options.appendSystemPrompt;
 		this.extensionsOverride = options.extensionsOverride;
@@ -386,6 +400,30 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	async reload(options?: ResourceLoaderReloadOptions): Promise<void> {
 		resetTimings("extensions");
+		if (
+			this.noExtensions &&
+			this.noSkills &&
+			this.noPromptTemplates &&
+			this.noThemes &&
+			this.noContextFiles &&
+			this.noSystemPrompt &&
+			this.noAppendSystemPrompt
+		) {
+			this.extensionsResult = { extensions: [], errors: [], runtime: createExtensionRuntime() };
+			this.skills = [];
+			this.skillDiagnostics = [];
+			this.prompts = [];
+			this.promptDiagnostics = [];
+			this.themes = [];
+			this.themeDiagnostics = [];
+			this.agentsFiles = [];
+			this.systemPrompt = undefined;
+			this.systemPromptSourcePath = undefined;
+			this.appendSystemPrompt = [];
+			this.appendSystemPromptSourcePaths = [];
+			this.loaded = true;
+			return;
+		}
 
 		if (this.loaded) {
 			clearExtensionCache();
@@ -522,17 +560,22 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const resolvedAgentsFiles = this.agentsFilesOverride ? this.agentsFilesOverride(agentsFiles) : agentsFiles;
 		this.agentsFiles = resolvedAgentsFiles.agentsFiles;
 
-		const systemPromptSource = this.systemPromptSource ?? this.discoverSystemPromptFile();
-		const baseSystemPrompt = resolvePromptInput(systemPromptSource, "system prompt");
+		const systemPromptSource = this.noSystemPrompt
+			? undefined
+			: (this.systemPromptSource ?? this.discoverSystemPromptFile());
+		const baseSystemPrompt = this.noSystemPrompt
+			? undefined
+			: resolvePromptInput(systemPromptSource, "system prompt");
 		this.systemPrompt = this.systemPromptOverride ? this.systemPromptOverride(baseSystemPrompt) : baseSystemPrompt;
 		this.systemPromptSourcePath =
 			systemPromptSource && existsSync(systemPromptSource) ? resolvePath(systemPromptSource) : undefined;
 
-		let appendSources = this.appendSystemPromptSource;
-		if (!appendSources) {
+		let appendSources = this.noAppendSystemPrompt ? [] : this.appendSystemPromptSource;
+		if (!this.noAppendSystemPrompt && !appendSources) {
 			const discoveredAppendSystemPromptFile = this.discoverAppendSystemPromptFile();
 			appendSources = discoveredAppendSystemPromptFile ? [discoveredAppendSystemPromptFile] : [];
 		}
+		appendSources ??= [];
 		const baseAppend = appendSources
 			.map((s) => resolvePromptInput(s, "append system prompt"))
 			.filter((s): s is string => s !== undefined);

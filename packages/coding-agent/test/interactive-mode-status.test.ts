@@ -71,6 +71,13 @@ type ExtensionFixture = {
 	sourceInfo?: SourceInfo;
 };
 
+function unmanagedCapabilities() {
+	return {
+		isCapabilityAllowed: () => true,
+		denyCapability: () => false,
+	};
+}
+
 describe("InteractiveMode.showStatus", () => {
 	beforeAll(() => {
 		// showStatus uses the global theme instance
@@ -155,6 +162,7 @@ describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 			}),
 		};
 		const fakeThis: any = {
+			...unmanagedCapabilities(),
 			session: { settingsManager },
 			settingsManager,
 			themeController: {
@@ -185,6 +193,7 @@ describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 			setTheme: vi.fn(),
 		};
 		const fakeThis: any = {
+			...unmanagedCapabilities(),
 			session: { settingsManager },
 			settingsManager,
 			themeController: {
@@ -403,6 +412,7 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 			{ id: "gpt-5.5", provider: "openai-codex", name: "GPT-5.5" },
 		];
 		const fakeThis: FakeInteractiveMode = {
+			...unmanagedCapabilities(),
 			session: {
 				scopedModels: [],
 				modelRuntime: { getAvailableSnapshot: () => models },
@@ -450,6 +460,7 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 			}
 		).prototype.createBaseAutocompleteProvider;
 		const fakeThis: FakeInteractiveMode = {
+			...unmanagedCapabilities(),
 			session: {
 				scopedModels: [],
 				modelRuntime: { getAvailableSnapshot: () => [] },
@@ -502,6 +513,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 		useRealScopeGroups?: boolean;
 	}) {
 		const fakeThis: any = {
+			...unmanagedCapabilities(),
 			options: { verbose: options.verbose ?? false },
 			toolOutputExpanded: options.toolOutputExpanded ?? false,
 			loadedResourcesContainer: new Container(),

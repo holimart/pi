@@ -68,6 +68,8 @@ export interface SettingsConfig {
 	httpIdleTimeoutMs: number;
 	thinkingLevel: ThinkingLevel;
 	availableThinkingLevels: ThinkingLevel[];
+	/** Whether settings may change the session thinking level. */
+	allowThinkingMutation: boolean;
 	currentTheme: string;
 	terminalTheme: TerminalTheme;
 	availableThemes: string[];
@@ -84,6 +86,8 @@ export interface SettingsConfig {
 	autocompleteMaxVisible: number;
 	quietStartup: boolean;
 	defaultProjectTrust: DefaultProjectTrust;
+	/** Whether settings may modify the global project-trust default. */
+	allowProjectTrustMutation: boolean;
 	clearOnShrink: boolean;
 	showTerminalProgress: boolean;
 	tuiMode: TuiMode;
@@ -571,13 +575,17 @@ export class SettingsSelectorComponent extends Container {
 				currentValue: config.enableInstallTelemetry ? "true" : "false",
 				values: ["true", "false"],
 			},
-			{
-				id: "default-project-trust",
-				label: "Default project trust",
-				description: "Fallback behavior when no extension or saved trust decision decides project trust",
-				currentValue: DEFAULT_PROJECT_TRUST_LABELS[config.defaultProjectTrust],
-				values: Object.values(DEFAULT_PROJECT_TRUST_LABELS),
-			},
+			...(config.allowProjectTrustMutation
+				? [
+						{
+							id: "default-project-trust",
+							label: "Default project trust",
+							description: "Fallback behavior when no extension or saved trust decision decides project trust",
+							currentValue: DEFAULT_PROJECT_TRUST_LABELS[config.defaultProjectTrust],
+							values: Object.values(DEFAULT_PROJECT_TRUST_LABELS),
+						},
+					]
+				: []),
 			{
 				id: "double-escape-action",
 				label: "Double-escape action",
@@ -607,28 +615,32 @@ export class SettingsSelectorComponent extends Container {
 						() => done(),
 					),
 			},
-			{
-				id: "thinking",
-				label: "Thinking level",
-				description: "Reasoning depth for thinking-capable models",
-				currentValue: config.thinkingLevel,
-				submenu: (currentValue, done) =>
-					new SelectSubmenu(
-						"Thinking Level",
-						"Select reasoning depth for thinking-capable models",
-						config.availableThinkingLevels.map((level) => ({
-							value: level,
-							label: level,
-							description: THINKING_DESCRIPTIONS[level],
-						})),
-						currentValue,
-						(value) => {
-							callbacks.onThinkingLevelChange(value as ThinkingLevel);
-							done(value);
+			...(config.allowThinkingMutation
+				? [
+						{
+							id: "thinking",
+							label: "Thinking level",
+							description: "Reasoning depth for thinking-capable models",
+							currentValue: config.thinkingLevel,
+							submenu: (currentValue: string, done: (selectedValue?: string) => void) =>
+								new SelectSubmenu(
+									"Thinking Level",
+									"Select reasoning depth for thinking-capable models",
+									config.availableThinkingLevels.map((level) => ({
+										value: level,
+										label: level,
+										description: THINKING_DESCRIPTIONS[level],
+									})),
+									currentValue,
+									(value) => {
+										callbacks.onThinkingLevelChange(value as ThinkingLevel);
+										done(value);
+									},
+									() => done(),
+								),
 						},
-						() => done(),
-					),
-			},
+					]
+				: []),
 			{
 				id: "tui-mode",
 				label: "TUI mode",

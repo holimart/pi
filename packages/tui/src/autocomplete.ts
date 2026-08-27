@@ -269,6 +269,70 @@ export interface AutocompleteProvider {
 	shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
 }
 
+/** Slash-command completion without any filesystem authority. */
+export class CommandAutocompleteProvider implements AutocompleteProvider {
+	private commands: (SlashCommand | AutocompleteItem)[];
+
+	constructor(commands: (SlashCommand | AutocompleteItem)[] = []) {
+		this.commands = commands;
+	}
+
+	async getSuggestions(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		_options: { signal: AbortSignal; force?: boolean },
+	): Promise<AutocompleteSuggestions | null> {
+		const textBeforeCursor = (lines[cursorLine] || "").slice(0, cursorCol);
+		if (!textBeforeCursor.startsWith("/")) return null;
+		const spaceIndex = textBeforeCursor.indexOf(" ");
+		if (spaceIndex !== -1) {
+			const command = this.commands.find((item) => {
+				const name = "name" in item ? item.name : item.value;
+				return name === textBeforeCursor.slice(1, spaceIndex);
+			});
+			if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) return null;
+			const items = await command.getArgumentCompletions(textBeforeCursor.slice(spaceIndex + 1));
+			return items && items.length > 0 ? { items, prefix: textBeforeCursor.slice(spaceIndex + 1) } : null;
+		}
+
+		const prefix = textBeforeCursor.slice(1);
+		const items = fuzzyFilter(
+			this.commands.map((command) => {
+				const name = "name" in command ? command.name : command.value;
+				const hint = "argumentHint" in command ? command.argumentHint : undefined;
+				const description = command.description ?? "";
+				return {
+					name,
+					label: name,
+					description: hint ? (description ? `${hint} — ${description}` : hint) : description || undefined,
+				};
+			}),
+			prefix,
+			(item) => item.name,
+		).map((item) => ({
+			value: item.name,
+			label: item.label,
+			...(item.description && { description: item.description }),
+		}));
+		return items.length > 0 ? { items, prefix: textBeforeCursor } : null;
+	}
+
+	applyCompletion(
+		lines: string[],
+		cursorLine: number,
+		cursorCol: number,
+		item: AutocompleteItem,
+		prefix: string,
+	): { lines: string[]; cursorLine: number; cursorCol: number } {
+		const currentLine = lines[cursorLine] || "";
+		const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
+		const newLines = [...lines];
+		newLines[cursorLine] = `${beforePrefix}/${item.value} ${currentLine.slice(cursorCol)}`;
+		return { lines: newLines, cursorLine, cursorCol: beforePrefix.length + item.value.length + 2 };
+	}
+}
+
 // Combined provider that handles both slash commands and file paths
 export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	private commands: (SlashCommand | AutocompleteItem)[];
