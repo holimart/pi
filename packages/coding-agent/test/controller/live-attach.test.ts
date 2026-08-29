@@ -52,10 +52,7 @@ class ActiveSession {
 }
 
 const directories = new Set<string>();
-const controllers = new Set<{ dispose(): Promise<void> }>();
 afterEach(async () => {
-	await Promise.all([...controllers].map((controller) => controller.dispose()));
-	controllers.clear();
 	await Promise.all([...directories].map((directory) => rm(directory, { recursive: true, force: true })));
 	directories.clear();
 });
@@ -95,10 +92,10 @@ describe("live RPC controller attachment", () => {
 		expect(session.followUps).toEqual(["deliver after this turn"]);
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		expect(events).toContainEqual(
-		expect.objectContaining({
-			type: "settlement",
-			settlement: expect.objectContaining({ commandId: receipt.commandId, state: "settled" }),
-		}),
+			expect.objectContaining({
+				type: "settlement",
+				settlement: expect.objectContaining({ commandId: receipt.commandId, state: "settled" }),
+			}),
 		);
 		client!.close();
 
