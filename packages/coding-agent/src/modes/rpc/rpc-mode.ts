@@ -13,6 +13,8 @@
 
 import * as crypto from "node:crypto";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
+import { RuntimeControllerProjection } from "../../controller/runtime-controller-projection.ts";
+import { type PeerUidReader, UnixControllerListener } from "../../controller/unix-controller-listener.ts";
 import type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -47,12 +49,62 @@ export type {
 	RpcSessionState,
 } from "./rpc-types.ts";
 
+export interface RpcModeOptions {
+	/** Opt-in controller socket path. Omitted by default so RPC mode is unchanged. */
+	controllerSocketPath?: string;
+	/** Injectable only for hosts with a native SO_PEERCRED/getpeereid bridge. */
+	controllerPeerUid?: PeerUidReader;
+}
+
+export interface RpcController {
+	rebindSession(): void;
+	dispose(): Promise<void>;
+}
+
+/**
+ * Start the controller transport used by opt-in RPC mode. This small exported
+ * seam lets the live socket be tested without taking ownership of stdin/stdout.
+ */
+export async function startRpcController(
+	runtimeHost: AgentSessionRuntime,
+	options: { path: string; peerUid?: PeerUidReader },
+): Promise<RpcController> {
+	const ownerUid = process.getuid?.();
+	if (ownerUid === undefined) throw new Error("Controller owner UID is unavailable");
+	const projection = new RuntimeControllerProjection(runtimeHost);
+	const listener = new UnixControllerListener({
+		path: options.path,
+		controller: projection,
+		ownerUid,
+		// Unix socket and containing directory are both owner-only (0600/0700).
+		// Hosts with SO_PEERCRED/getpeereid can supply the stronger native bridge.
+		peerUid: options.peerUid ?? (() => ownerUid),
+	});
+	try {
+		await listener.start();
+	} catch (error) {
+		await projection.dispose();
+		throw error;
+	}
+	return {
+		rebindSession: () => projection.rebindSession(),
+		dispose: async () => {
+			await listener.close();
+			await projection.dispose();
+		},
+	};
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
+export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<never> {
 	takeOverStdout();
+	const controllerSocketPath = options.controllerSocketPath ?? process.env.PI_CONTROLLER_SOCKET;
+	const controller = controllerSocketPath
+		? await startRpcController(runtimeHost, { path: controllerSocketPath, peerUid: options.controllerPeerUid })
+		: undefined;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
@@ -350,6 +402,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			},
 		});
 
+		controller?.rebindSession();
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
@@ -731,6 +784,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		await controller?.dispose();
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();

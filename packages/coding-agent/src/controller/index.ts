@@ -1,5 +1,6 @@
 export { ControllerAttachClient, sendControllerEnvelope } from "./controller-attach-client.ts";
 export { ControllerComposer, installControllerComposer } from "./controller-composer.ts";
+export { RuntimeControllerProjection } from "./runtime-controller-projection.ts";
 export { SessionControllerRuntimeAdapter } from "./session-controller-runtime.ts";
 export type {
 	AgentDirected,
