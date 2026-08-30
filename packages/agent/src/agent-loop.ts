@@ -223,6 +223,14 @@ async function runLoop(
 
 			await emit({ type: "turn_end", message, toolResults });
 
+			// A tool may ignore its abort signal. Do not run lifecycle hooks or ask the
+			// provider for another turn after cancellation; the aborted tool batch has
+			// already emitted its terminal tool events.
+			if (signal?.aborted) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
+
 			const nextTurnContext = {
 				message,
 				toolResults,
@@ -482,7 +490,7 @@ async function executeToolCallsSequential(
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(finalizedCalls),
+		terminate: signal?.aborted || shouldTerminateToolBatch(finalizedCalls),
 	};
 }
 
@@ -549,7 +557,7 @@ async function executeToolCallsParallel(
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		terminate: signal?.aborted || shouldTerminateToolBatch(orderedFinalizedCalls),
 	};
 }
 
@@ -674,13 +682,21 @@ async function executePreparedToolCall(
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
+	const aborted = Symbol("tool execution aborted");
+	let abortListener: (() => void) | undefined;
+
+	const abortPromise = new Promise<typeof aborted>((resolve) => {
+		abortListener = () => resolve(aborted);
+		if (signal?.aborted) {
+			abortListener();
+		} else {
+			signal?.addEventListener("abort", abortListener, { once: true });
+		}
+	});
 
 	try {
-		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
-			prepared.args as never,
-			signal,
-			(partialResult) => {
+		const toolPromise = Promise.resolve(
+			prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) => {
 				if (!acceptingUpdates) return;
 				updateEvents.push(
 					Promise.resolve(
@@ -693,10 +709,17 @@ async function executePreparedToolCall(
 						}),
 					),
 				);
-			},
+			}),
 		);
+		const result = await Promise.race([toolPromise, abortPromise]);
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
+		if (result === aborted) {
+			return {
+				result: { ...createErrorToolResult("Operation aborted"), terminate: true },
+				isError: true,
+			};
+		}
 		return { result, isError: false };
 	} catch (error) {
 		acceptingUpdates = false;
@@ -707,6 +730,9 @@ async function executePreparedToolCall(
 		};
 	} finally {
 		acceptingUpdates = false;
+		if (abortListener) {
+			signal?.removeEventListener("abort", abortListener);
+		}
 	}
 }
 
@@ -720,6 +746,16 @@ async function finalizeExecutedToolCall(
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
+
+	// An abort is terminal. Do not let an optional post-tool hook delay it or
+	// replace the terminating result with one that would trigger another turn.
+	if (signal?.aborted) {
+		return {
+			toolCall: prepared.toolCall,
+			result: { ...result, terminate: true },
+			isError: true,
+		};
+	}
 
 	if (config.afterToolCall) {
 		try {

@@ -298,6 +298,74 @@ describe("Agent", () => {
 		expect(receivedSignal?.aborted).toBe(true);
 	});
 
+	it("should settle an aborted run when a tool ignores its abort signal", async () => {
+		const toolSchema = Type.Object({});
+		let markToolStarted = () => {};
+		const toolStarted = new Promise<void>((resolve) => {
+			markToolStarted = resolve;
+		});
+		const events: AgentEvent[] = [];
+		const tool: AgentTool<typeof toolSchema, Record<string, never>> = {
+			name: "never_settles",
+			label: "Never settles",
+			description: "Deliberately ignores cancellation",
+			parameters: toolSchema,
+			execute() {
+				markToolStarted();
+				return new Promise<never>(() => {});
+			},
+		};
+		let streamCalls = 0;
+		const agent = new Agent({
+			initialState: { tools: [tool] },
+			streamFn: () => {
+				streamCalls++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantToolUseMessage([
+							{ type: "toolCall", id: "call-1", name: "never_settles", arguments: {} },
+						]),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.subscribe((event) => {
+			events.push(event);
+		});
+
+		const prompt = agent.prompt("run the tool");
+		await toolStarted;
+		agent.abort();
+
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				prompt,
+				new Promise<never>((_resolve, reject) => {
+					timeout = setTimeout(() => reject(new Error("aborted tool run did not settle")), 250);
+				}),
+			]);
+		} finally {
+			if (timeout) clearTimeout(timeout);
+		}
+
+		await agent.waitForIdle();
+		expect(streamCalls).toBe(1);
+		const toolEnd = events.find((event) => event.type === "tool_execution_end");
+		expect(toolEnd).toBeDefined();
+		if (toolEnd?.type === "tool_execution_end") {
+			expect(toolEnd.isError).toBe(true);
+			expect(toolEnd.result.terminate).toBe(true);
+		}
+		expect(events.some((event) => event.type === "agent_end")).toBe(true);
+		expect(agent.state.pendingToolCalls).toEqual(new Set());
+		expect(agent.state.isStreaming).toBe(false);
+	});
+
 	it("should ignore tool updates after the tool execution settles", async () => {
 		const toolSchema = Type.Object({});
 		let delayedUpdate: AgentToolUpdateCallback<{ status: string }> | undefined;
