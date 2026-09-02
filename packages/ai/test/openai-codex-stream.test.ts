@@ -381,6 +381,84 @@ describe("openai-codex streaming", () => {
 		expect(result.errorMessage).toBe("Codex SSE response headers timed out after 10ms");
 	});
 
+	it("aborts a stalled SSE body that stops yielding tokens after the idle timeout", async () => {
+		const token = mockToken();
+		const encoder = new TextEncoder();
+		let cancelled = false;
+		// Headers arrive and one delta streams, then the body goes silent forever
+		// while the socket stays open -- the in-flight hang. Without a per-read
+		// idle timeout, `reader.read()` would block indefinitely.
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					encoder.encode(
+						`${[
+							`data: ${JSON.stringify({
+								type: "response.output_item.added",
+								item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] },
+							})}`,
+							`data: ${JSON.stringify({ type: "response.content_part.added", part: { type: "output_text", text: "" } })}`,
+							`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+						].join("\n\n")}\n\n`,
+					),
+				);
+				// Never enqueue a terminal event and never close the controller.
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+
+		const fetchMock = vi.fn(async (input: string | URL) => {
+			const url = typeof input === "string" ? input : input.toString();
+			if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
+				return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
+			}
+			if (url.startsWith("https://raw.githubusercontent.com/openai/codex/")) {
+				return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
+			}
+			if (url === "https://chatgpt.com/backend-api/codex/responses") {
+				return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+			}
+			return new Response("not found", { status: 404 });
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context: Context = {
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		};
+
+		const resultStream = streamOpenAICodexResponses(model, context, {
+			apiKey: token,
+			transport: "sse",
+			// timeoutMs bounds stream idleness after connection (per StreamOptions).
+			timeoutMs: 80,
+		});
+		let sawTextDelta = false;
+		for await (const event of resultStream) {
+			if (event.type === "text_delta") sawTextDelta = true;
+		}
+		const result = await resultStream.result();
+
+		expect(sawTextDelta).toBe(true);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("idle timeout");
+		expect(cancelled).toBe(true);
+	});
+
 	it("aborts SSE body reads after response headers arrive", async () => {
 		const token = mockToken();
 		const encoder = new TextEncoder();

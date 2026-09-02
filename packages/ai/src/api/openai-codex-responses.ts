@@ -204,6 +204,22 @@ function normalizeTimeoutMs(value: number | undefined): number | undefined {
 	return Math.floor(value);
 }
 
+/**
+ * Error thrown when an in-flight SSE response body goes idle (no bytes for
+ * `idleTimeoutMs`) after the response headers have already arrived. The
+ * per-request `timeoutMs`/`AbortSignal.timeout` only bounds the initial
+ * header fetch; without this guard a Codex response that stops yielding
+ * tokens while holding the socket open would hang the read forever. Mirrors
+ * the WebSocket transport's `WebSocket idle timeout` so both transports honor
+ * the documented "stream idleness after connection uses timeoutMs" contract.
+ */
+class CodexStreamIdleTimeoutError extends Error {
+	constructor(idleTimeoutMs: number) {
+		super(`Codex SSE stream idle timeout after ${idleTimeoutMs}ms`);
+		this.name = "CodexStreamIdleTimeoutError";
+	}
+}
+
 // ============================================================================
 // Request Compression
 // ============================================================================
@@ -662,12 +678,23 @@ async function processStream(
 	grammarToolInputProperties: ReadonlyMap<string, string>,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal)), output, stream, model, {
-		serviceTier: options?.serviceTier,
-		grammarToolInputProperties,
-		resolveServiceTier: resolveCodexServiceTier,
-		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-	});
+	// Bound stream idleness after the headers arrive, matching the WebSocket
+	// transport's `idleTimeoutMs`. The per-request `timeoutMs` only guards the
+	// initial header fetch; without this a Codex response that stops yielding
+	// tokens while holding the socket open would hang `reader.read()` forever.
+	const streamIdleTimeoutMs = normalizeTimeoutMs(options?.timeoutMs);
+	await processResponsesStream(
+		mapCodexEvents(parseSSE(response, options?.signal, streamIdleTimeoutMs)),
+		output,
+		stream,
+		model,
+		{
+			serviceTier: options?.serviceTier,
+			grammarToolInputProperties,
+			resolveServiceTier: resolveCodexServiceTier,
+			applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+		},
+	);
 }
 
 class CodexApiError extends Error {
@@ -761,7 +788,11 @@ function normalizeCodexStatus(status: unknown): CodexResponseStatus | undefined 
 // SSE Parsing
 // ============================================================================
 
-async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerator<Record<string, unknown>> {
+async function* parseSSE(
+	response: Response,
+	signal?: AbortSignal,
+	idleTimeoutMs?: number,
+): AsyncGenerator<Record<string, unknown>> {
 	if (!response.body) return;
 
 	const reader = response.body.getReader();
@@ -772,12 +803,37 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 	};
 	signal?.addEventListener("abort", onAbort, { once: true });
 
+	// Race each read against an idle timer that resets on every chunk. A stalled
+	// stream (socket held open, no bytes) trips it; a stream that keeps yielding
+	// tokens never does. `undefined`/`0` disables it (operator "disabled").
+	type ReadResult = Awaited<ReturnType<typeof reader.read>>;
+	const readWithIdleTimeout = (): Promise<ReadResult> => {
+		const read = reader.read();
+		if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) return read;
+		return new Promise<ReadResult>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				void reader.cancel().catch(() => {});
+				reject(new CodexStreamIdleTimeoutError(idleTimeoutMs));
+			}, idleTimeoutMs);
+			read.then(
+				(result) => {
+					clearTimeout(timer);
+					resolve(result);
+				},
+				(error) => {
+					clearTimeout(timer);
+					reject(error);
+				},
+			);
+		});
+	};
+
 	try {
 		while (true) {
 			if (signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
-			const { done, value } = await reader.read();
+			const { done, value } = await readWithIdleTimeout();
 			if (signal?.aborted) {
 				throw new Error("Request was aborted");
 			}
