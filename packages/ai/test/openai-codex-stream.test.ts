@@ -1684,6 +1684,155 @@ describe("openai-codex streaming", () => {
 		});
 	});
 
+	// npm undici's WebSocket (installed globally by coding-agent's http
+	// dispatcher) collapses every rejected upgrade into an empty ErrorEvent plus
+	// close 1006, so a usage cap, an expired token and an edge block used to be
+	// reported identically as "WebSocket error".
+	it.each([
+		[
+			"a usage cap",
+			{
+				status: 429,
+				statusText: "Too Many Requests",
+				headers: { "retry-after": "3600", "x-ratelimit-remaining": "0", authorization: "Bearer leaked" },
+				body: '{"detail": "You have hit your ChatGPT usage limit."}',
+			},
+			["HTTP 429 Too Many Requests", "retry-after=3600", "x-ratelimit-remaining=0", "usage limit"],
+			429,
+		],
+		[
+			"an expired token",
+			{
+				status: 401,
+				statusText: "Unauthorized",
+				headers: {},
+				body: '{"detail": "Missing or invalid bearer token."}',
+			},
+			["HTTP 401 Unauthorized", "invalid bearer token"],
+			401,
+		],
+		[
+			"an edge block",
+			{ status: 403, statusText: "Forbidden", headers: { "cf-ray": "8f0a-DFW" }, body: "error code: 1020" },
+			["HTTP 403 Forbidden", "cf-ray=8f0a-DFW", "error code: 1020"],
+			403,
+		],
+	] as const)(
+		"surfaces %s hidden behind an opaque websocket transport failure",
+		async (_name, upgrade, expectedFragments, expectedStatus) => {
+			const token = mockToken();
+			const encoder = new TextEncoder();
+			const sse = buildSSEPayload({ status: "completed" });
+			const sessionId = `ws-blind-${upgrade.status}`;
+
+			const fetchMock = vi.fn(async (input: string | URL, init?: RequestInit) => {
+				const url = typeof input === "string" ? input : input.toString();
+				if (url !== "https://chatgpt.com/backend-api/codex/responses") {
+					throw new Error(`Unexpected URL: ${url}`);
+				}
+				// The handshake probe is a GET; the SSE fallback is the POST.
+				if ((init?.method ?? "GET") === "GET") {
+					return new Response(upgrade.body, {
+						status: upgrade.status,
+						statusText: upgrade.statusText,
+						headers: upgrade.headers,
+					});
+				}
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(encoder.encode(sse));
+							controller.close();
+						},
+					}),
+					{ status: 200, headers: { "content-type": "text/event-stream" } },
+				);
+			});
+			vi.stubGlobal("fetch", fetchMock);
+
+			class BlindMockWebSocket {
+				private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+				constructor() {
+					queueMicrotask(() => {
+						// Exactly what npm undici emits: no message, no cause, no code.
+						this.dispatch("error", { message: "", error: new TypeError("") });
+						this.dispatch("close", { code: 1006, reason: "", wasClean: false });
+					});
+				}
+
+				addEventListener(type: string, listener: (event: unknown) => void): void {
+					let listeners = this.listeners.get(type);
+					if (!listeners) {
+						listeners = new Set();
+						this.listeners.set(type, listeners);
+					}
+					listeners.add(listener);
+				}
+
+				removeEventListener(type: string, listener: (event: unknown) => void): void {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				send(): void {
+					throw new Error("send should not be called on a failed websocket");
+				}
+
+				close(): void {}
+
+				private dispatch(type: string, event: unknown): void {
+					for (const listener of this.listeners.get(type) ?? []) listener(event);
+				}
+			}
+
+			vi.stubGlobal("WebSocket", BlindMockWebSocket);
+
+			const model: Model<"openai-codex-responses"> = {
+				id: "gpt-5.1-codex",
+				name: "GPT-5.1 Codex",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 400000,
+				maxTokens: 128000,
+			};
+			const context: Context = {
+				systemPrompt: "You are a helpful assistant.",
+				messages: [{ role: "user", content: "Say hello", timestamp: 1 }],
+			};
+
+			const result = await streamOpenAICodexResponses(model, context, {
+				apiKey: token,
+				sessionId,
+				transport: "auto",
+			}).result();
+
+			expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
+
+			const diagnostic = result.diagnostics?.find((entry) => entry.type === "provider_transport_failure");
+			expect(diagnostic).toBeDefined();
+			for (const fragment of expectedFragments) {
+				expect(diagnostic?.error?.message).toContain(fragment);
+			}
+			// The old behavior; the point of the change is that it is gone.
+			expect(diagnostic?.error?.message).not.toBe("WebSocket error");
+			// Credentials are sent to the probe but never reported back.
+			expect(JSON.stringify(diagnostic)).not.toContain("leaked");
+			expect(diagnostic?.details?.websocket).toMatchObject({
+				closeCode: 1006,
+				httpStatus: expectedStatus,
+			});
+			expect(getOpenAICodexWebSocketDebugStats(sessionId)).toMatchObject({
+				websocketFailures: 1,
+				sseFallbacks: 1,
+				websocketFallbackActive: true,
+			});
+		},
+	);
+
 	it("reconnects once when the websocket connection limit is reached before output starts", async () => {
 		const token = mockToken();
 		let connections = 0;

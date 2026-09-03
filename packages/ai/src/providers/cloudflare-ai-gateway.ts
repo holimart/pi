@@ -9,7 +9,11 @@ import { cloudflareStreams } from "./cloudflare-stream.ts";
 export function cloudflareAIGatewayProvider(): Provider<
 	"anthropic-messages" | "openai-completions" | "openai-responses"
 > {
-	return createProvider({
+	// The generated catalog currently only carries anthropic-messages and
+	// openai-responses models, so TApi would be inferred from `models` and the
+	// openai-completions entry below would be rejected. Pin TApi to the APIs
+	// this provider implements instead of narrowing the api map.
+	return createProvider<"anthropic-messages" | "openai-completions" | "openai-responses">({
 		id: "cloudflare-ai-gateway",
 		name: "Cloudflare AI Gateway",
 		auth: { apiKey: cloudflareAIGatewayAuth() },

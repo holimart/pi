@@ -383,6 +383,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 								eventsEmitted: websocketStarted,
 								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
 								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+								websocket: describeWebSocketTransportFailure(error),
 							}),
 						);
 						recordWebSocketFailure(cacheSessionId, error);
@@ -883,6 +884,35 @@ async function* parseSSE(
 const OPENAI_BETA_RESPONSES_WEBSOCKETS = "responses_websockets=2026-02-06";
 const SESSION_WEBSOCKET_CACHE_TTL_MS = 5 * 60 * 1000;
 const SESSION_WEBSOCKET_MAX_AGE_MS = 55 * 60 * 1000;
+const WEBSOCKET_ABNORMAL_CLOSE_CODE = 1006;
+const WEBSOCKET_HANDSHAKE_PROBE_TIMEOUT_MS = 5_000;
+const WEBSOCKET_HANDSHAKE_PROBE_BODY_LIMIT = 400;
+// undici reports every rejected upgrade with the same placeholder text (and
+// npm undici >= 8 reports no text at all), so these strings carry no signal and
+// must not suppress the handshake probe below.
+const WEBSOCKET_GENERIC_FAILURE_MESSAGES = new Set([
+	"Received network error or non-101 status code.",
+	"Received network error or non-200 status code.",
+]);
+// Response headers worth reporting when an upgrade is rejected: they are what
+// tells a usage cap apart from an auth failure or an edge block. Anything that
+// looks like a credential is dropped by WEBSOCKET_HANDSHAKE_REDACTED_HEADERS.
+const WEBSOCKET_HANDSHAKE_REPORTED_HEADERS = new Set([
+	"retry-after",
+	"retry-after-ms",
+	"content-type",
+	"server",
+	"date",
+	"cf-ray",
+	"cf-mitigated",
+	"x-request-id",
+	"x-should-retry",
+	"www-authenticate",
+]);
+const WEBSOCKET_HANDSHAKE_REPORTED_HEADER_PREFIXES = ["x-ratelimit-", "ratelimit-", "x-codex-", "x-openai-"];
+// Defense in depth on top of the allow-list above: never report a header whose
+// name reads like a credential, however it got allow-listed.
+const WEBSOCKET_HANDSHAKE_REDACTED_HEADERS = /(^|-)(authorization|cookie|token|secret|key|credential)(-|$)/i;
 
 type WebSocketEventType = "open" | "message" | "error" | "close";
 type WebSocketListener = (event: unknown) => void;
@@ -1042,18 +1072,74 @@ async function getWebSocketConstructor(env?: ProviderEnv): Promise<WebSocketCons
 	return ctor as unknown as WebSocketConstructor;
 }
 
+/**
+ * Everything the runtime is willing to tell us about a failed Codex WebSocket.
+ *
+ * The events alone are close to useless: coding-agent installs npm undici's
+ * globals, and npm undici routes every connect failure through
+ * `failWebsocketConnection` -> `#onSocketClose`, which drops the close code,
+ * the close reason and the whole handshake response, then fires
+ * `ErrorEvent { message: "", error: TypeError("") }` followed by
+ * `CloseEvent { code: 1006, reason: "" }`. Node's bundled undici is only
+ * marginally better: one placeholder message for every cause. So a usage cap
+ * (429), an expired token (401) and an edge block (403) all look identical
+ * unless we go and ask — which is what `probeWebSocketHandshake` does.
+ */
+export interface WebSocketFailureDetails {
+	/** Close code from the `close` event (1006 = closed with no close frame). */
+	closeCode?: number;
+	/** Close reason from the `close` event, when the peer sent one. */
+	closeReason?: string;
+	wasClean?: boolean;
+	/** Text carried by the `error` event (or its nested error). */
+	eventMessage?: string;
+	/** Constructor name of the nested error, e.g. `TypeError`. */
+	errorName?: string;
+	errorCode?: string | number;
+	/** Real transport failure undici hides in `error.cause` (ENOTFOUND, ...). */
+	causeMessage?: string;
+	causeCode?: string | number;
+	/** HTTP status recovered by re-requesting the endpoint after the failure. */
+	httpStatus?: number;
+	httpStatusText?: string;
+	/** Allow-listed, credential-free response headers (retry-after, ratelimit). */
+	httpHeaders?: Record<string, string>;
+	/** Truncated response body, where OpenAI puts the human-readable reason. */
+	httpBody?: string;
+	/** Why the handshake probe itself could not answer. */
+	handshakeProbeError?: string;
+}
+
 class WebSocketCloseError extends Error {
 	readonly code?: number;
 	readonly reason?: string;
 	readonly wasClean?: boolean;
+	readonly details?: WebSocketFailureDetails;
 
-	constructor(message: string, options?: { code?: number; reason?: string; wasClean?: boolean }) {
+	constructor(
+		message: string,
+		options?: { code?: number; reason?: string; wasClean?: boolean; details?: WebSocketFailureDetails },
+	) {
 		super(message);
 		this.name = "WebSocketCloseError";
 		this.code = options?.code;
 		this.reason = options?.reason;
 		this.wasClean = options?.wasClean;
+		this.details = options?.details;
 	}
+}
+
+/**
+ * Structured transport detail for `provider_transport_failure` diagnostics.
+ * `extractDiagnosticError` only forwards name/message/stack/code, so the same
+ * facts are also folded into the error message by
+ * `formatWebSocketFailureMessage`.
+ */
+export function describeWebSocketTransportFailure(error: unknown): WebSocketFailureDetails | undefined {
+	if (!(error instanceof WebSocketCloseError)) return undefined;
+	const details = error.details;
+	if (!details || Object.values(details).every((value) => value === undefined)) return undefined;
+	return details;
 }
 
 function getWebSocketReadyState(socket: WebSocketLike): number | undefined {
@@ -1109,6 +1195,8 @@ async function connectWebSocket(
 		let settled = false;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let socket: WebSocketLike;
+		let failureDetails: WebSocketFailureDetails | undefined;
+		let failureScheduled = false;
 
 		try {
 			socket = new WebSocketCtor(url, { headers: wsHeaders });
@@ -1142,11 +1230,36 @@ async function connectWebSocket(
 			cleanup();
 			resolve(socket);
 		};
+		// The `error` and `close` events each carry half the story and undici
+		// fires them back to back in the same tick, so settling on whichever
+		// arrives first discards the other half — historically the close code.
+		// Collect both, then recover the HTTP status if neither said anything.
+		const settleFailure = async () => {
+			if (settled) return;
+			let details = failureDetails ?? {};
+			if (shouldProbeWebSocketHandshake(details)) {
+				details = mergeWebSocketFailureDetails(details, await probeWebSocketHandshake(url, wsHeaders, signal));
+			}
+			fail(createWebSocketFailureError(details, "WebSocket error"), "transport_failure");
+		};
+		const recordFailure = (details: WebSocketFailureDetails) => {
+			failureDetails = mergeWebSocketFailureDetails(failureDetails, details);
+			if (settled || failureScheduled) return;
+			failureScheduled = true;
+			// Stop the connect timeout from winning the race against the probe.
+			if (timeout) {
+				clearTimeout(timeout);
+				timeout = undefined;
+			}
+			queueMicrotask(() => {
+				void settleFailure();
+			});
+		};
 		const onError: WebSocketListener = (event) => {
-			fail(extractWebSocketError(event));
+			recordFailure(collectWebSocketErrorDetails(event));
 		};
 		const onClose: WebSocketListener = (event) => {
-			fail(extractWebSocketCloseError(event));
+			recordFailure(collectWebSocketCloseDetails(event));
 		};
 		const onAbort = () => {
 			fail(new Error("Request was aborted"), "aborted");
@@ -1265,44 +1378,241 @@ async function acquireWebSocket(
 	};
 }
 
-function extractWebSocketError(event: unknown): Error {
-	if (event && typeof event === "object") {
-		const message = "message" in event ? (event as { message?: unknown }).message : undefined;
-		if (typeof message === "string" && message.length > 0) {
-			return new Error(message);
-		}
+function readEventString(source: unknown, key: string): string | undefined {
+	if (!source || typeof source !== "object") return undefined;
+	const value = (source as Record<string, unknown>)[key];
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
 
-		const nestedError = "error" in event ? (event as { error?: unknown }).error : undefined;
-		if (nestedError instanceof Error && nestedError.message.length > 0) {
-			return nestedError;
-		}
-		if (nestedError && typeof nestedError === "object" && "message" in nestedError) {
-			const nestedMessage = (nestedError as { message?: unknown }).message;
-			if (typeof nestedMessage === "string" && nestedMessage.length > 0) {
-				return new Error(nestedMessage);
-			}
+function readEventErrorCode(source: unknown): string | number | undefined {
+	if (!source || typeof source !== "object") return undefined;
+	const value = (source as { code?: unknown }).code;
+	return typeof value === "string" || typeof value === "number" ? value : undefined;
+}
+
+function collectWebSocketErrorDetails(event: unknown): WebSocketFailureDetails {
+	const details: WebSocketFailureDetails = {};
+	if (!event || typeof event !== "object") return details;
+
+	details.eventMessage = readEventString(event, "message");
+	const nestedError = (event as { error?: unknown }).error;
+	if (nestedError && typeof nestedError === "object") {
+		details.eventMessage ??= readEventString(nestedError, "message");
+		const name = readEventString(nestedError, "name");
+		if (name && name !== "Error") details.errorName = name;
+		details.errorCode = readEventErrorCode(nestedError);
+		// Node's bundled undici puts the real transport failure (ENOTFOUND,
+		// ECONNREFUSED, TLS verification, UND_ERR_SOCKET) in `cause` while the
+		// message stays a placeholder; the old extractor threw it away.
+		const cause = (nestedError as { cause?: unknown }).cause;
+		if (cause !== undefined) {
+			details.causeMessage = typeof cause === "string" ? cause : readEventString(cause, "message");
+			details.causeCode = readEventErrorCode(cause);
 		}
 	}
-	return new Error("WebSocket error");
+	return details;
+}
+
+function collectWebSocketCloseDetails(event: unknown): WebSocketFailureDetails {
+	const details: WebSocketFailureDetails = {};
+	if (!event || typeof event !== "object") return details;
+
+	const code = (event as { code?: unknown }).code;
+	if (typeof code === "number") details.closeCode = code;
+	details.closeReason = readEventString(event, "reason");
+	const wasClean = (event as { wasClean?: unknown }).wasClean;
+	if (typeof wasClean === "boolean") details.wasClean = wasClean;
+	if (!details.closeReason && details.closeCode === WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE) {
+		details.closeReason = "message too big";
+	}
+	return details;
+}
+
+function mergeWebSocketFailureDetails(...parts: (WebSocketFailureDetails | undefined)[]): WebSocketFailureDetails {
+	const merged: Record<string, unknown> = {};
+	for (const part of parts) {
+		if (!part) continue;
+		for (const [key, value] of Object.entries(part)) {
+			if (value !== undefined) merged[key] ??= value;
+		}
+	}
+	return merged as WebSocketFailureDetails;
+}
+
+function describeWebSocketCloseCode(code: number | undefined): string | undefined {
+	switch (code) {
+		case 1000:
+			return "normal closure";
+		case 1001:
+			return "going away";
+		case 1002:
+			return "protocol error";
+		case 1005:
+			return "no close code";
+		case WEBSOCKET_ABNORMAL_CLOSE_CODE:
+			return "abnormal closure, no close frame";
+		case 1008:
+			return "policy violation";
+		case WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE:
+			return "message too big";
+		case 1011:
+			return "server error";
+		case 1013:
+			return "try again later";
+		case 1015:
+			return "TLS handshake failure";
+		default:
+			return undefined;
+	}
+}
+
+function formatWebSocketHeaderHints(headers: Record<string, string> | undefined): string | undefined {
+	if (!headers) return undefined;
+	const entries = Object.entries(headers).map(([name, value]) => `${name}=${value}`);
+	return entries.length > 0 ? entries.join(", ") : undefined;
+}
+
+/**
+ * Fold every recovered fact into the message, because that is the only field
+ * `extractDiagnosticError` reliably forwards into an assistant diagnostic.
+ * With nothing recovered the message stays the historical placeholder.
+ */
+function formatWebSocketFailureMessage(details: WebSocketFailureDetails, fallback: string): string {
+	const parts: string[] = [];
+	if (details.httpStatus !== undefined) {
+		parts.push(`HTTP ${details.httpStatus}${details.httpStatusText ? ` ${details.httpStatusText}` : ""}`);
+	}
+	if (details.closeCode !== undefined) {
+		const label = details.closeReason ?? describeWebSocketCloseCode(details.closeCode);
+		parts.push(`close ${details.closeCode}${label ? ` ${label}` : ""}`);
+	} else if (details.closeReason) {
+		parts.push(`close ${details.closeReason}`);
+	}
+	if (details.eventMessage) parts.push(details.eventMessage);
+	if (details.causeMessage) parts.push(`cause ${details.causeMessage}`);
+	else if (details.causeCode !== undefined) parts.push(`cause ${details.causeCode}`);
+	const headerHints = formatWebSocketHeaderHints(details.httpHeaders);
+	if (headerHints) parts.push(headerHints);
+	if (details.httpBody) parts.push(details.httpBody);
+	if (details.handshakeProbeError) parts.push(`handshake probe failed: ${details.handshakeProbeError}`);
+
+	if (parts.length === 0) {
+		return details.errorName ? `${fallback} (${details.errorName})` : fallback;
+	}
+	return `${fallback}: ${parts.join("; ")}`;
+}
+
+function createWebSocketFailureError(details: WebSocketFailureDetails, fallback: string): WebSocketCloseError {
+	return new WebSocketCloseError(formatWebSocketFailureMessage(details, fallback), {
+		code: details.closeCode,
+		reason: details.closeReason,
+		wasClean: details.wasClean,
+		details,
+	});
+}
+
+function isGenericWebSocketFailureText(text: string | undefined): boolean {
+	return text === undefined || WEBSOCKET_GENERIC_FAILURE_MESSAGES.has(text);
+}
+
+/**
+ * Only probe when the events said nothing usable. A real close reason, a real
+ * error message or a `cause` already explains the failure, and re-requesting
+ * would just be an extra call.
+ */
+function shouldProbeWebSocketHandshake(details: WebSocketFailureDetails): boolean {
+	if (details.httpStatus !== undefined) return false;
+	if (details.causeMessage !== undefined || details.causeCode !== undefined) return false;
+	return isGenericWebSocketFailureText(details.eventMessage) && isGenericWebSocketFailureText(details.closeReason);
+}
+
+function resolveWebSocketProbeUrl(url: string): string | undefined {
+	if (url.startsWith("wss://")) return `https://${url.slice("wss://".length)}`;
+	if (url.startsWith("ws://")) return `http://${url.slice("ws://".length)}`;
+	if (url.startsWith("https://") || url.startsWith("http://")) return url;
+	return undefined;
+}
+
+function shouldReportHandshakeHeader(name: string): boolean {
+	if (WEBSOCKET_HANDSHAKE_REDACTED_HEADERS.test(name)) return false;
+	if (WEBSOCKET_HANDSHAKE_REPORTED_HEADERS.has(name)) return true;
+	return WEBSOCKET_HANDSHAKE_REPORTED_HEADER_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+
+async function readWebSocketProbeBody(response: Response): Promise<string | undefined> {
+	try {
+		const collapsed = (await response.text()).replace(/\s+/g, " ").trim();
+		if (!collapsed) return undefined;
+		return collapsed.length > WEBSOCKET_HANDSHAKE_PROBE_BODY_LIMIT
+			? `${collapsed.slice(0, WEBSOCKET_HANDSHAKE_PROBE_BODY_LIMIT)}...`
+			: collapsed;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Recover the HTTP status the WebSocket layer threw away.
+ *
+ * undici's fetch rejects `Connection`/`Upgrade`/`Sec-WebSocket-*` as forbidden
+ * header names, so this is a plain authenticated GET rather than a replayed
+ * upgrade. It still traverses the same edge, auth and quota layers that
+ * rejected the upgrade, which is exactly what separates 429 (usage cap, with
+ * `retry-after`) from 401 (auth) and 403 (edge block). Credentials are sent,
+ * never reported: only allow-listed non-credential response headers come back.
+ */
+async function probeWebSocketHandshake(
+	url: string,
+	headers: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<WebSocketFailureDetails> {
+	const probeUrl = resolveWebSocketProbeUrl(url);
+	if (!probeUrl || typeof globalThis.fetch !== "function") return {};
+
+	const probeHeaders: Record<string, string> = {};
+	for (const [name, value] of Object.entries(headers)) {
+		const lower = name.toLowerCase();
+		if (lower === "connection" || lower === "upgrade" || lower.startsWith("sec-websocket-")) continue;
+		probeHeaders[name] = value;
+	}
+
+	const combined = combineAbortSignals([signal, AbortSignal.timeout(WEBSOCKET_HANDSHAKE_PROBE_TIMEOUT_MS)]);
+	try {
+		const response = await globalThis.fetch(probeUrl, {
+			method: "GET",
+			headers: probeHeaders,
+			redirect: "manual",
+			signal: combined.signal,
+		});
+		const reportedHeaders: Record<string, string> = {};
+		for (const [name, value] of response.headers) {
+			const lower = name.toLowerCase();
+			if (shouldReportHandshakeHeader(lower)) reportedHeaders[lower] = value;
+		}
+		const details: WebSocketFailureDetails = {
+			httpStatus: response.status,
+			httpStatusText: response.statusText || undefined,
+			httpHeaders: Object.keys(reportedHeaders).length > 0 ? reportedHeaders : undefined,
+		};
+		details.httpBody = await readWebSocketProbeBody(response);
+		return details;
+	} catch (error) {
+		return { handshakeProbeError: formatThrownValue(error) };
+	} finally {
+		combined.cleanup();
+	}
 }
 
 function extractWebSocketCloseError(event: unknown): Error {
-	if (event && typeof event === "object") {
-		const code = "code" in event ? (event as { code?: unknown }).code : undefined;
-		const reason = "reason" in event ? (event as { reason?: unknown }).reason : undefined;
-		const wasClean = "wasClean" in event ? (event as { wasClean?: unknown }).wasClean : undefined;
-		const codeText = typeof code === "number" ? ` ${code}` : "";
-		let reasonText = typeof reason === "string" && reason.length > 0 ? ` ${reason}` : "";
-		if (!reasonText && code === WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE) {
-			reasonText = " message too big";
-		}
-		return new WebSocketCloseError(`WebSocket closed${codeText}${reasonText}`.trim(), {
-			code: typeof code === "number" ? code : undefined,
-			reason: typeof reason === "string" && reason.length > 0 ? reason : undefined,
-			wasClean: typeof wasClean === "boolean" ? wasClean : undefined,
-		});
-	}
-	return new Error("WebSocket closed");
+	const details = collectWebSocketCloseDetails(event);
+	const codeText = details.closeCode !== undefined ? ` ${details.closeCode}` : "";
+	const label = details.closeReason ?? describeWebSocketCloseCode(details.closeCode);
+	return new WebSocketCloseError(`WebSocket closed${codeText}${label ? ` ${label}` : ""}`.trim(), {
+		code: details.closeCode,
+		reason: details.closeReason,
+		wasClean: details.wasClean,
+		details,
+	});
 }
 
 async function decodeWebSocketData(data: unknown): Promise<string | null> {
@@ -1332,6 +1642,8 @@ async function* parseWebSocket(
 	let done = false;
 	let failed: Error | null = null;
 	let sawCompletion = false;
+	let sawFailureEvent = false;
+	let failureDetails: WebSocketFailureDetails | undefined;
 
 	const wake = () => {
 		if (!pending) return;
@@ -1367,7 +1679,9 @@ async function* parseWebSocket(
 	};
 
 	const onError: WebSocketListener = (event) => {
-		failed = extractWebSocketError(event);
+		sawFailureEvent = true;
+		failureDetails = mergeWebSocketFailureDetails(failureDetails, collectWebSocketErrorDetails(event));
+		failed = createWebSocketFailureError(failureDetails, "WebSocket error");
 		done = true;
 		wake();
 	};
@@ -1378,7 +1692,12 @@ async function* parseWebSocket(
 			wake();
 			return;
 		}
-		if (!failed) {
+		failureDetails = mergeWebSocketFailureDetails(failureDetails, collectWebSocketCloseDetails(event));
+		// The close event is what carries the code and reason. Let it refine an
+		// already-recorded `error` event instead of being dropped outright.
+		if (sawFailureEvent) {
+			failed = createWebSocketFailureError(failureDetails, "WebSocket error");
+		} else if (!failed) {
 			failed = extractWebSocketCloseError(event);
 		}
 		done = true;
